@@ -1,0 +1,350 @@
+---
+title: "RYOE Analysis"
+author: "Matthew Kraus"
+date: "2024-01-10"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
+```
+
+```{r Libraries}
+library(tidyverse)
+library(tidymodels)
+library(data.table)
+library(nflverse)
+library(vip)
+library(gt)
+library(gtExtras)
+
+Sys.setenv(CHROMOTE_CHROME = "C:/Users/15622/AppData/Local/Google/Chrome/Application/chrome.exe")
+```
+
+```{r Data Import}
+clear_cache()
+playbyplay <- data.table(load_pbp(2003:2023))
+players <- data.table(load_players())
+teams <- data.table(load_teams())
+draft <- data.table(load_draft_picks())
+roster <- data.table(load_rosters(seasons = 2023))
+```
+
+```{r Clean Data}
+playbyplay1 <- playbyplay[, c("play_id", "game_id", "yardline_100", "game_date", "week", "season_type", "quarter_seconds_remaining", "half_seconds_remaining", "game_seconds_remaining", "game_half", "qtr", "down", "ydstogo", "ydsnet", "yards_gained", "shotgun", "no_huddle", "qb_scramble", "run_location", "run_gap", "home_timeouts_remaining", "away_timeouts_remaining", "posteam_timeouts_remaining", "defteam_timeouts_remaining", "score_differential", "weather", "time_of_day", "location", "surface", "temp", "wind", "stadium_id", "stadium", "rusher_id", "rush", "fumble", "ep", "vegas_wp", "posteam", "defteam")]
+
+runsonly <- playbyplay1[rush == 1 & qb_scramble == 0 & fumble == 0]
+
+runsonly <- left_join(runsonly, players[, c("gsis_id", "display_name")], by = c("rusher_id" = "gsis_id"))
+
+runsonly[, season := as.numeric(substr(game_id, 1, 4))]
+
+runsonly <- runsonly[!is.na(run_location)]
+
+players[, headshot := ifelse(gsis_id == "00-0038611", "https://shorturl.at/xAKMR",
+                             ifelse(gsis_id == "00-0038979", "https://shorturl.at/huQZ9",
+                                    ifelse(gsis_id == "00-0038685", "https://shorturl.at/gwCGW",
+                                           ifelse(gsis_id == "00-0038738", "https://shorturl.at/dnNQU", headshot))))]
+```
+
+```{r Model 1 Data / Split / KFold}
+model_data1 <- runsonly[run_location == "middle", c("season_type","yardline_100", "quarter_seconds_remaining", "half_seconds_remaining", "game_seconds_remaining", "qtr", "down", "ydstogo", "shotgun", "no_huddle", "vegas_wp", "ep", "display_name", "rusher_id", "posteam", "season", "yards_gained")]
+
+set.seed(321)
+train1 <- model_data1[season %in% sample(2003:2023, 16, replace = F)]
+test1 <- model_data1[!(season %in% train1$season)]
+
+recipe1 <- recipe(yards_gained ~ yardline_100 + quarter_seconds_remaining + half_seconds_remaining + game_seconds_remaining + qtr + down + ydstogo + shotgun + no_huddle + vegas_wp + ep, data = train1) %>% step_dummy(all_nominal_predictors())
+
+kfold1 <- vfold_cv(train1, v = 5, strata = yards_gained)
+```
+
+```{r Model 1}
+set.seed(123)
+xgb_model1 <- boost_tree(trees = 1000,
+                        tree_depth = 3,
+                        min_n = 40,
+                        loss_reduction = 0.000611422336938452,
+                        sample_size = 0.184455864322837,
+                        mtry = 8,
+                        learn_rate = 0.0123110665902037) %>% 
+                        set_engine("xgboost") %>% 
+                        set_mode("regression")
+
+# xgb_grid1 <- grid_latin_hypercube(
+#   tree_depth(),
+#   min_n(),
+#   loss_reduction(),
+#   sample_size = sample_prop(),
+#   finalize(mtry(), train1),
+#   learn_rate(),
+#   size = 50)
+
+xgb_wf1 <- workflow() %>%
+   add_model(xgb_model1) %>%
+   add_recipe(recipe1)
+
+# set.seed(123)
+# xgb_tune1 <- tune_grid(
+#   xgb_wf1,
+#   resamples = kfold1,
+#   grid = xgb_grid1,
+#   control = control_grid(save_pred = TRUE)
+# )
+
+# collect_metrics(xgb_tune1)
+# 
+# xgb_best1 <- select_best(xgb_tune1, "rmse")
+
+# xgb_final1 <- finalize_workflow(
+#   xgb_wf1,
+#   xgb_best1)
+
+set.seed(123)
+xgb_final_fit1 <- xgb_wf1 %>%
+   fit(data = train1)
+
+xgb_pred1 <- data.table(xgb_final_fit1 %>% predict(new_data = train1) %>% bind_cols(train1))
+
+xgb_predtest1 <- data.table(xgb_final_fit1 %>% predict(test1) %>% bind_cols(test1))
+
+xgb_pred1 %>% rmse(truth = yards_gained, estimate = .pred)
+
+xgb_predtest1 %>% rmse(truth = yards_gained, estimate = .pred)
+
+vipplot1 <- xgb_final_fit1 %>% extract_fit_parsnip() %>% vip(20)
+vipplot1
+
+# ggsave(filename = "vipplot_middle.png", plot = vipplot1)
+```
+
+```{r Model 2 Data / Split / KFold}
+model_data2 <- runsonly[run_location %in% c("left", "right"), c("season_type", "yardline_100", "quarter_seconds_remaining", "half_seconds_remaining", "game_seconds_remaining", "qtr", "down", "ydstogo", "shotgun", "no_huddle", "run_location", "vegas_wp", "ep", "display_name", "rusher_id", "posteam", "season", "yards_gained")]
+
+set.seed(321)
+train2 <- model_data2[season %in% sample(2003:2023, 16, replace = F)]
+test2 <- model_data2[!(season %in% train1$season)]
+
+recipe2 <- recipe(yards_gained ~ yardline_100 + quarter_seconds_remaining + half_seconds_remaining + game_seconds_remaining + qtr + down + ydstogo + shotgun + no_huddle + run_location + vegas_wp + ep, data = train2) %>% step_dummy(all_nominal_predictors())
+
+kfold2 <- vfold_cv(train2, v = 5, strata = yards_gained)
+```
+
+```{r Model 2}
+set.seed(123)
+xgb_model2 <- boost_tree(trees = 1000,
+                        tree_depth = 3,
+                        min_n = 40,
+                        loss_reduction = 0.000611422336938452,
+                        sample_size = 0.184455864322837,
+                        mtry = 9,
+                        learn_rate = 0.0123110665902037) %>% 
+                        set_engine("xgboost") %>% 
+                        set_mode("regression")
+
+# xgb_grid2 <- grid_latin_hypercube(
+#   tree_depth(),
+#   min_n(),
+#   loss_reduction(),
+#   sample_size = sample_prop(),
+#   finalize(mtry(), train2),
+#   learn_rate(),
+#   size = 50)
+
+xgb_wf2 <- workflow() %>%
+   add_model(xgb_model2) %>%
+   add_recipe(recipe2)
+
+# set.seed(123)
+# xgb_tune2 <- tune_grid(
+#   xgb_wf2,
+#   resamples = kfold2,
+#   grid = xgb_grid2,
+#   control = control_grid(save_pred = TRUE)
+# )
+
+# collect_metrics(xgb_tune2)
+# 
+# xgb_best2 <- select_best(xgb_tune2, "rmse")
+
+# xgb_final2 <- finalize_workflow(
+#   xgb_wf2,
+#   xgb_best2)
+
+set.seed(123)
+xgb_final_fit2 <- xgb_wf2 %>%
+   fit(data = train2)
+
+xgb_pred2 <- data.table(xgb_final_fit2 %>% predict(new_data = train2) %>% bind_cols(train2))
+
+xgb_predtest2 <- data.table(xgb_final_fit2 %>% predict(new_data = test2) %>% bind_cols(test2))
+
+xgb_pred2 %>% rmse(truth = yards_gained, estimate = .pred)
+
+xgb_predtest2 %>% rmse(truth = yards_gained, estimate = .pred)
+
+vipplot2 <- xgb_final_fit2 %>% extract_fit_parsnip() %>% vip(20)
+vipplot2
+
+# ggsave(filename = "vipplot_outside.png", plot = vipplot2)
+```
+
+```{r Combine All Data}
+fullresults <- rbind(xgb_pred1, xgb_predtest1, xgb_pred2, xgb_predtest2, fill = T) %>% rename(xp_yards_gained = .pred)
+fullresults[, run_location := ifelse(is.na(run_location), "middle", run_location)]
+fullresults <- fullresults[, c("display_name", "rusher_id", "posteam", "season", "yardline_100", "quarter_seconds_remaining", "half_seconds_remaining", "game_seconds_remaining", "season_type", "qtr", "down", "ydstogo", "shotgun", "no_huddle", "run_location", "vegas_wp", "ep", "yards_gained", "xp_yards_gained")]
+
+results19to23 <- left_join(fullresults[season %in% 2019:2023], draft[, c("gsis_id", "round", "pick")], by = c("rusher_id" = "gsis_id"))
+results19to23[, round := ifelse(is.na(round), "UDFA", round)]
+results19to23[, pick := ifelse(is.na(pick), "UDFA", pick)]
+
+results19to23 <- left_join(results19to23, players[, c("gsis_id", "position_group", "position")], by = c("rusher_id" = "gsis_id")) %>% relocate(position_group, .after = rusher_id) %>% relocate(position, .before = posteam) 
+rbresults19to23 <- results19to23[position_group == "RB"]
+```
+
+```{r Combine Only Test Data}
+fulltestresults <- rbind(xgb_predtest1, xgb_predtest2, fill = T) %>% rename(xp_yards_gained = .pred)
+fulltestresults[, run_location := ifelse(is.na(run_location), "middle", run_location)]
+fulltestresults <- fulltestresults[, c("display_name", "rusher_id", "posteam", "season", "yardline_100", "quarter_seconds_remaining", "half_seconds_remaining", "game_seconds_remaining", "season_type", "qtr", "down", "ydstogo", "shotgun", "no_huddle", "run_location", "vegas_wp", "ep", "yards_gained", "xp_yards_gained")]
+```
+
+```{r 2023 RYOE Visualization Data}
+rbplayerresults2023 <- data.table(rbresults19to23[season == 2023] %>% group_by(display_name, rusher_id) %>% summarise(TotalRushYds = sum(yards_gained), ExpectedRushYds = round(sum(xp_yards_gained), 0), RYOE = TotalRushYds - ExpectedRushYds, RushAtt = n()) %>% mutate(RYOE_PerAtt = round(RYOE / RushAtt, 2)))
+
+playerresults2023 <- data.table(fulltestresults[season == 2023 & season_type == "REG"] %>% group_by(display_name, rusher_id) %>% summarise(TotalRushYds = sum(yards_gained), ExpectedRushYds = round(sum(xp_yards_gained), 0), RYOE = TotalRushYds - ExpectedRushYds, RushAtt = n()) %>% mutate(RYOE_PerAtt = round(RYOE / RushAtt, 2)))
+
+team_setup <- left_join(playerresults2023, players[, c("gsis_id", "team_abbr")], by = c("rusher_id" = "gsis_id"))
+
+teamresults2023 <- team_setup %>% group_by(team_abbr) %>% summarise(TeamRYOE = sum(RYOE), TeamRushAtt = sum(RushAtt), RYOE_PerAtt = TeamRYOE / TeamRushAtt)
+teamresults2023 <- left_join(teamresults2023, teams[, c("team_abbr", "team_color")], by = "team_abbr")
+
+rbplayerresults2023 <- left_join(rbplayerresults2023, roster[, c("gsis_id", "team")], by = c("rusher_id" = "gsis_id")) %>% relocate(team, .before = rusher_id)
+
+actualvsexpected <- ggplot(rbplayerresults2023, aes(x = TotalRushYds, y = ExpectedRushYds, color = rusher_id)) +
+  geom_point(show.legend = F, aes(color = team, fill = team), size = 2, alpha = 0.75) +
+  geom_smooth(method = "lm", color = "grey", alpha = 0.1) +
+  scale_color_nfl(type = "primary") +
+  scale_fill_nfl(alpha = 0.65) +
+  ggtitle("Actual Rushing Yards vs. Expected Rushing Yards - 2023 Season") +
+  xlab("Actual Rushing Yards") +
+  ylab("Expected Rushing Yards") +
+  labs(caption = "Correlation: 97.9%") +
+  theme_minimal() +
+  theme(plot.title = element_text(hjust = 0.5))
+
+# ggsave(filename = "actualvsexpected.png", plot = actualvsexpected)
+```
+
+```{r RYOE Visualizations}
+teamryoe <- ggplot(teamresults2023, aes(x = fct_reorder(team_abbr, desc(TeamRYOE)), y = TeamRYOE)) +
+geom_col(aes(color = team_abbr, fill = team_abbr), width = 0.5) +
+scale_color_nfl(type = "primary") +
+scale_fill_nfl(alpha = 0.65) +
+ggtitle("2023 Rushing Yards Over Expected (RYOE) by Team") +
+ylab("RYOE") +
+theme_minimal() +
+theme(plot.title = element_text(hjust = 0.5, face = "bold"),
+      axis.title.x = element_blank(),
+      axis.text.x = element_nfl_logo(),
+      )
+
+top10ryoe <- rbplayerresults2023 %>%
+  filter(RushAtt >= 25) %>% 
+  select(rusher_id, display_name, RYOE) %>% 
+  arrange(desc(RYOE)) %>% 
+  head(10) %>% 
+  gt() %>%
+  gt_theme_538() %>% 
+  tab_header(title = "Best Rushers in 2023 - RYOE",
+             subtitle = "min. 25 carries") %>% 
+  gt_nfl_headshots(columns = rusher_id, height = 40) %>%
+  cols_label(rusher_id = " ",
+             display_name = "Player",
+             RYOE = "Rush Yards Over Expected") %>% 
+  tab_style(locations = cells_body(columns = RYOE),
+            style = cell_text(color = "white")
+            ) %>% 
+  data_color(columns = RYOE,
+             autocolor_text = F,
+             fn = scales::col_numeric(
+               palette = c("#9ACD32", "#008E00"),
+               domain = c(103, 309)
+               )
+             ) %>% 
+  opt_align_table_header(align = "center")
+
+bottom10ryoe <- rbplayerresults2023 %>%
+  filter(RushAtt >= 25) %>% 
+  select(rusher_id, display_name, RYOE) %>% 
+  arrange(RYOE) %>% 
+  head(10) %>% 
+  gt() %>%
+  gt_theme_538() %>% 
+  tab_header(title = "Worst Rushers in 2023 - RYOE",
+             subtitle = "min. 25 carries") %>%
+  gt_nfl_headshots(columns = rusher_id, height = 40) %>%
+  cols_label(rusher_id = " ",
+             display_name = "Player",
+             RYOE = "Rush Yards Over Expected") %>% 
+  tab_style(locations = cells_body(columns = RYOE),
+            style = cell_text(color = "white")
+            ) %>% 
+  data_color(columns = RYOE,
+             autocolor_text = F,
+             fn = scales::col_numeric(
+               palette = c("#FF0000", "#FFA500"),
+               domain = c(-215, -150)
+               )
+             ) %>% 
+  opt_align_table_header(align = "center")
+
+top10perattryoe <- rbplayerresults2023 %>%
+  filter(RushAtt >= 25) %>% 
+  select(rusher_id, display_name, RYOE_PerAtt) %>% 
+  arrange(desc(RYOE_PerAtt)) %>% 
+  head(10) %>% 
+  gt() %>% 
+  gt_theme_538() %>% 
+  tab_header(title = "Top 10 Rushers - RYOE Per Attempt",
+             subtitle = "min. 25 carries") %>%
+  gt_nfl_headshots(columns = rusher_id, height = 40) %>% 
+  cols_label(rusher_id = " ",
+             display_name = "Player",
+             RYOE_PerAtt = "RYOE Per Attempt") %>% 
+  tab_style(locations = cells_body(columns = RYOE_PerAtt),
+            style = cell_text(color = "white")
+            ) %>%
+  data_color(columns = RYOE_PerAtt,
+             autocolor_text = F,
+             fn = scales::col_numeric(
+               palette = c("#9ACD32", "#008E00"),
+               domain = c(.76, 3.63)
+               )
+             ) %>% 
+  opt_align_table_header(align = "center")
+
+# ggsave(filename = "teamryoe.png", plot = teamryoe)
+# gtsave(top10ryoe, filename = "top10ryoe.png")
+# gtsave(bottom10ryoe, filename = "bottom10ryoe.png")
+# gtsave(top10perattryoe, filename = "top10perattryoe.png")
+```
+
+```{r RYOE by Round}
+rbresults19to23 <- data.table(rbresults19to23 %>% group_by(display_name, rusher_id, season, round, pick) %>% summarise(TotalRushYds = sum(yards_gained), ExpectedRushYds = round(sum(xp_yards_gained), 0), RYOE = TotalRushYds - ExpectedRushYds, RushAtt = n()) %>% mutate(RYOE_PerAtt = round(RYOE / RushAtt, 2)))
+```
+
+```{r RYOE by Round Visualization}
+ryoebyround <- ggplot(rbresults19to23[RushAtt >= 10], aes(x = round, y = RYOE_PerAtt, fill = round)) +
+  geom_boxplot(show.legend = F, alpha = 0.75) +
+  ggtitle("Rushing Yards Over Expected Per Attempt by Round Selected", subtitle = "min. 25 carries") +
+  xlab("Draft Round") +
+  ylab("RYOE Per Attempt") +
+  scale_fill_manual(values = rep(c("#013369", "#D50A0A"), 4)) +
+  scale_color_manual(values = rep(c("#D50A0A", "#013369"), 4)) +
+  theme_minimal() +
+  theme(plot.title = element_text(hjust = 0.5, face = "bold"),
+        plot.subtitle = element_text(hjust = 0.91),
+        axis.title.x = element_text(vjust = -0.05))
+
+# ggsave(filename = "ryoebyround.png", plot = ryoebyround)
+```
